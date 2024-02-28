@@ -11,5 +11,6 @@ from .pascal_voc_evaluation import PascalVOCDetectionEvaluator
 from .sem_seg_evaluation import SemSegEvaluator
 from .ow_sem_seg_evaluation import OWSemSegEvaluator
 from .testing import print_csv_format, verify_results
+from .ow_cityscapes_evaluation import OWCityscapesEvaluator, OWCityscapesInstanceEvaluator, OWCityscapesSemSegEvaluator
 
 __all__ = [k for k in globals().keys() if not k.startswith("_")]

@@ -90,8 +90,12 @@ class OWSemSegEvaluator(SemSegEvaluator):
             ) as f:
                 gt = np.array(Image.open(f), dtype=int)
 
-            gt[gt == self._ignore_label] = self._num_classes
-
+            # gt[gt == self._ignore_label] = self._num_classes
+            if gt.max() > self._ignore_label: ## panoptic seg dataset
+                gt[gt==65535] = self._num_classes
+            else:
+               gt[gt == self._ignore_label] = self._num_classes
+               
             self._conf_matrix += np.bincount(
                 (self._num_classes + 1) * pred.reshape(-1) + gt.reshape(-1),
                 minlength=self._conf_matrix.size,
