@@ -29,7 +29,7 @@ class OWCOCOPanopticEvaluator(DatasetEvaluator):
     It contains a synchronize call and has to be called from all workers.
     """
 
-    def __init__(self, dataset_name: str, output_dir: Optional[str] = None, simi_matrix_path: Optional[str] = '/mnt/haiwen/pretrained_models/ade_openvoc_similarity_matrix.csv'):
+    def __init__(self, dataset_name: str, output_dir: Optional[str] = None, simi_matrix_path: Optional[str] = '/mnt/haiwen/pretrained_models/ade_openvoc_similarity_matrix.csv', new_to_old_cat_map_path: Optional[str] = None):
         """
         Args:
             dataset_name: name of the dataset
@@ -45,6 +45,7 @@ class OWCOCOPanopticEvaluator(DatasetEvaluator):
 
         self._output_dir = output_dir
         self._simi_matrix_path = simi_matrix_path
+        self._new_to_old_cat_map_path = new_to_old_cat_map_path
         if self._output_dir is not None:
             PathManager.mkdirs(self._output_dir)
 
@@ -56,6 +57,8 @@ class OWCOCOPanopticEvaluator(DatasetEvaluator):
         if isthing is None:
             # the model produces panoptic category id directly. No more conversion needed
             return segment_info
+        # if isthing is True and segment_info["category_id"] not in self._thing_contiguous_id_to_dataset_id:
+        #     print(f'Category id {segment_info["category_id"]} not in thing_contiguous_id_to_dataset_id')
         if isthing is True:
             segment_info["category_id"] = self._thing_contiguous_id_to_dataset_id[
                 segment_info["category_id"]
@@ -148,6 +151,7 @@ class OWCOCOPanopticEvaluator(DatasetEvaluator):
                     gt_folder=gt_folder,
                     pred_folder=pred_dir,
                     simi_matrix_path=self._simi_matrix_path,
+                    new_to_old_cat_map_path=self._new_to_old_cat_map_path
                 )
 
         res = {}

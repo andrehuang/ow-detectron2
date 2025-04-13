@@ -34,6 +34,7 @@ class OWSemSegEvaluator(SemSegEvaluator):
         ignore_label=None,
         post_process_func=None,
         simi_matrix_dir=None,
+        new_to_old_cat_map_path=None
     ):
         super().__init__(
             dataset_name,
@@ -65,6 +66,29 @@ class OWSemSegEvaluator(SemSegEvaluator):
             print('true way')
         else:
             self.simi_matrix = None
+        self.new_to_old_cat_map_path = new_to_old_cat_map_path
+        if new_to_old_cat_map_path is not None:
+            with open(new_to_old_cat_map_path, 'r') as f:
+                new_to_old_cat_map_load = json.load(f)
+                new_to_old_cat_map = {}
+            # transform the string keys to int keys
+            for k in new_to_old_cat_map_load:
+                if k != 'old_categories':
+                    new_to_old_cat_map[int(k)] = new_to_old_cat_map_load[k]
+
+            # Modify the simi matrix
+            # If the old category is the same, the similarity is 1
+            for i in range(self._num_classes):
+                for j in range(self._num_classes):
+                    if new_to_old_cat_map[i] == new_to_old_cat_map[j]:
+                        self.simi_matrix[i,j] = 1
+            new_to_old_cat_map['old_categories'] = new_to_old_cat_map_load['old_categories']
+        else:
+            # id mapping
+            new_to_old_cat_map = {i:i for i in range(10000)}
+            new_to_old_cat_map['old_categories'] = None
+            # new_to_old_cat_map['old_categories'] = [str(i) for i in range(num_classes)]
+        self.new_to_old_cat_map = new_to_old_cat_map
 
     def process(self, inputs, outputs):
         """
@@ -114,6 +138,19 @@ class OWSemSegEvaluator(SemSegEvaluator):
             row, col = np.diag_indices_from(cur_ow_conf_matrix)
             cur_ow_conf_matrix[row,col] = ow_tp
 
+            if self.new_to_old_cat_map['old_categories'] is not None:
+                old_categories = self.new_to_old_cat_map['old_categories']
+                new_cur_ow_conf_matrix = np.zeros((len(old_categories)+1, len(old_categories)+1))
+
+                # Modify the cur_ow_conf_matrix based on the new_to_old_cat_map
+                # We will maek the new cur_ow_conf_matrix to have the number of old_classes+1
+                for i in range(self._num_classes):
+                    for j in range(self._num_classes):
+                        # if self.new_to_old_cat_map[i] == self.new_to_old_cat_map[j]:
+                        new_cur_ow_conf_matrix[self.new_to_old_cat_map[i], self.new_to_old_cat_map[j]] += cur_ow_conf_matrix[i,j]
+                cur_ow_conf_matrix = new_cur_ow_conf_matrix
+                # shape of cur_ow_conf_matrix is (num_old_classes+1, num_old_classes+1)
+
             tp = cur_conf_matrix.diagonal()[:-1].astype(float)
             iou = np.full(self._num_classes, np.nan, dtype=float)
             pos_gt = np.sum(cur_conf_matrix[:-1, :-1], axis=0).astype(float)
@@ -125,7 +162,10 @@ class OWSemSegEvaluator(SemSegEvaluator):
             miou = np.sum(iou[acc_valid]) / np.sum(iou_valid)
 
             tp_ow = cur_ow_conf_matrix.diagonal()[:-1].astype(float)
-            iou_ow = np.full(self._num_classes, np.nan, dtype=float)
+            if self.new_to_old_cat_map_path is not None:
+                iou_ow = np.full(len(old_categories), np.nan, dtype=float)
+            else:
+                iou_ow = np.full(self._num_classes, np.nan, dtype=float)
             pos_gt_ow = np.sum(cur_ow_conf_matrix[:-1, :-1], axis=0).astype(float)
             pos_pred_ow = np.sum(cur_ow_conf_matrix[:-1, :-1], axis=1).astype(float)
             acc_valid_ow = pos_gt_ow > 0
@@ -137,7 +177,11 @@ class OWSemSegEvaluator(SemSegEvaluator):
             fn.write(input["file_name"]+'\t'+"mIoU\t"+str(miou)+'\t'+'OWmIoU\t'+str(miou_ow)+'\t'+'difference\t'+str(miou_ow-miou)+'\t')
             perIoU = {}
             perOWIoU = {}
-            for i, name in enumerate(self._class_names):
+            if self.new_to_old_cat_map_path is not None:
+                class_names = [cat['name'] for cat in old_categories]
+            else:
+                class_names = self._class_names
+            for i, name in enumerate(class_names):
                 if not np.isnan(iou[i]):
                     perIoU["IoU-{}".format(name)] = 100 * iou[i]
                 if not np.isnan(iou_ow[i]):
@@ -175,14 +219,36 @@ class OWSemSegEvaluator(SemSegEvaluator):
             row, col = np.diag_indices_from(self._conf_matrix)
             self._conf_matrix[row,col] = ow_tp
 
+            # Dump self._conf_matrix
+            print('Saving OW confusion matrix to: ', os.path.join(self._output_dir, 'newname_conf_matrix.npy'))
+            np.save(os.path.join(self._output_dir, 'newname_conf_matrix.npy'), self._conf_matrix)
+
+            if self.new_to_old_cat_map['old_categories'] is not None:
+                old_categories = self.new_to_old_cat_map['old_categories']
+                new_cur_ow_conf_matrix = np.zeros((len(old_categories)+1, len(old_categories)+1))
+
+                # Modify the cur_ow_conf_matrix based on the new_to_old_cat_map
+                # We will maek the new cur_ow_conf_matrix to have the number of old_classes+1
+                for i in range(self._num_classes):
+                    for j in range(self._num_classes):
+                        # if self.new_to_old_cat_map[i] == self.new_to_old_cat_map[j]:
+                        new_cur_ow_conf_matrix[self.new_to_old_cat_map[i], self.new_to_old_cat_map[j]] += self._conf_matrix[i,j]
+                self._conf_matrix = new_cur_ow_conf_matrix
+                print('Saving old name confusion matrix to: ', os.path.join(self._output_dir, 'oldname_conf_matrix.npy'))
+                np.save(os.path.join(self._output_dir, 'oldname_conf_matrix.npy'), self._conf_matrix)
+
         if self._output_dir:
             PathManager.mkdirs(self._output_dir)
             file_path = os.path.join(self._output_dir, "sem_seg_predictions.json")
             with PathManager.open(file_path, "w") as f:
                 f.write(json.dumps(self._predictions))
 
-        acc = np.full(self._num_classes, np.nan, dtype=float)
-        iou = np.full(self._num_classes, np.nan, dtype=float)
+        if self.new_to_old_cat_map_path is not None:
+            iou = np.full(len(old_categories), np.nan, dtype=float)
+            acc = np.full(len(old_categories), np.nan, dtype=float)
+        else:
+            iou = np.full(self._num_classes, np.nan, dtype=float)
+            acc = np.full(self._num_classes, np.nan, dtype=float)
         tp = self._conf_matrix.diagonal()[:-1].astype(float)
         pos_gt = np.sum(self._conf_matrix[:-1, :-1], axis=0).astype(float)
         class_weights = pos_gt / np.sum(pos_gt)
@@ -200,11 +266,15 @@ class OWSemSegEvaluator(SemSegEvaluator):
         res = {}
         res["mIoU"] = 100 * miou
         res["fwIoU"] = 100 * fiou
-        for i, name in enumerate(self._class_names):
+        if self.new_to_old_cat_map_path is not None:
+            class_names = [cat['name'] for cat in old_categories]
+        else:
+            class_names = self._class_names
+        for i, name in enumerate(class_names):
             res["IoU-{}".format(name)] = 100 * iou[i]
         res["mACC"] = 100 * macc
         res["pACC"] = 100 * pacc
-        for i, name in enumerate(self._class_names):
+        for i, name in enumerate(class_names):
             res["ACC-{}".format(name)] = 100 * acc[i]
         if self._evaluation_set is not None:
             for set_name, set_inds in self._evaluation_set.items():

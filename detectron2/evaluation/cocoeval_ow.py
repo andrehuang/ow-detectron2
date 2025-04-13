@@ -7,6 +7,7 @@ from collections import defaultdict
 from pycocotools import mask as maskUtils
 from .simiaccess import SIMIaccess
 import copy
+import json
 
 class OWCOCOeval:
     # Interface for evaluating detection on the Microsoft COCO dataset.
@@ -58,7 +59,7 @@ class OWCOCOeval:
     # Data, paper, and tutorials available at:  http://mscoco.org/
     # Code written by Piotr Dollar and Tsung-Yi Lin, 2015.
     # Licensed under the Simplified BSD License [see coco/license.txt]
-    def __init__(self, cocoGt=None, cocoDt=None, iouType='segm', simi_matrix_dir=None):
+    def __init__(self, cocoGt=None, cocoDt=None, iouType='segm', simi_matrix_dir=None,new_to_old_cat_map_path=None):
         '''
         Initialize CocoEval using coco APIs for gt and dt
         :param cocoGt: coco object with ground truth annotations
@@ -82,6 +83,23 @@ class OWCOCOeval:
             self.params.imgIds = sorted(cocoGt.getImgIds())
             self.params.catIds = sorted(cocoGt.getCatIds())
         # print('simiPath:', self.params.simiPath)
+        self.new_to_old_cat_map_path = new_to_old_cat_map_path
+        if new_to_old_cat_map_path is not None:
+            print("Loading new to old category map from", new_to_old_cat_map_path)
+            with open(new_to_old_cat_map_path, 'r') as f:
+                new_to_old_cat_map_load = json.load(f)
+                new_to_old_cat_map = {}
+            # transform the string keys to int keys
+            for k in new_to_old_cat_map_load:
+                if k != 'old_categories':
+                    new_to_old_cat_map[int(k)] = new_to_old_cat_map_load[k]
+            new_to_old_cat_map['old_categories'] = new_to_old_cat_map_load['old_categories']
+        else:
+            # id mapping
+            new_to_old_cat_map = {i:i for i in range(10000)}
+            new_to_old_cat_map['old_categories'] = None
+            # new_to_old_cat_map['old_categories'] = [str(i) for i in range(num_classes)]
+        self.new_to_old_cat_map = new_to_old_cat_map
 
 
     def _prepare(self):
@@ -321,10 +339,12 @@ class OWCOCOeval:
                     dtm[tind,dind]  = gt[m]['id']
                     gtm[tind,m]     = d['id']
                     if p.openEva:
-                        # import ipdb; ipdb.set_trace()
                         # print('dt, gt:', dt_lb[dind], gt_lb[m])
-                        stm[tind,dind] = simiAccess.findSimiElement(dt_lb[dind], gt_lb[m])
-                        ltm[tind,dind] = gt_lb[m]
+                        if self.new_to_old_cat_map[dt_lb[dind]] == self.new_to_old_cat_map[gt_lb[m]]:
+                            stm[tind,dind] = 1
+                        else:
+                            stm[tind,dind] = simiAccess.findSimiElement(dt_lb[dind], gt_lb[m])
+                        ltm[tind,dind] = self.new_to_old_cat_map[gt_lb[m]]
         # set unmatched detections outside of area range to ignore
         a = np.array([d['area']<aRng[0] or d['area']>aRng[1] for d in dt]).reshape((1, len(dt)))
         dtIg = np.logical_or(dtIg, np.logical_and(dtm==0, np.repeat(a,T,0)))
@@ -344,6 +364,9 @@ class OWCOCOeval:
                     'dtIgnore':     dtIg,
                 }
         else:
+            ## Converting everything to old category number
+            dt_lb = [self.new_to_old_cat_map[lb] for lb in dt_lb]
+            gt_lb = [self.new_to_old_cat_map[lb] for lb in gt_lb]
             return {
                     'image_id':     imgId,
                     'category_id':  catId,
@@ -376,6 +399,10 @@ class OWCOCOeval:
             p = self.params
 
         ptrueCatIds = p.catIds # save the real condition to wheather use true cats
+        if self.new_to_old_cat_map_path is not None:
+            # use old categories for pTrueCatIds
+            # TODO: Check whether this works for both COCO and ADE20K
+            ptrueCatIds = [cat['id'] for cat in self.new_to_old_cat_map['old_categories']]
 
         p.catIds = p.catIds if p.useCats == 1 and not p.openEva else [-1]
         T           = len(p.iouThrs)

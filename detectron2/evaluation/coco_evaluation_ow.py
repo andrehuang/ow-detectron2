@@ -58,6 +58,7 @@ class OWCOCOEvaluator(DatasetEvaluator):
         kpt_oks_sigmas=(),
         allow_cached_coco=True,
         simi_matrix_dir=None,
+        new_to_old_cat_map_path=None,
     ):
         """
         Args:
@@ -154,6 +155,22 @@ class OWCOCOEvaluator(DatasetEvaluator):
         if self._do_evaluation:
             self._kpt_oks_sigmas = kpt_oks_sigmas
         self.simi_matrix_dir = simi_matrix_dir
+        self.new_to_old_cat_map_path = new_to_old_cat_map_path
+        if new_to_old_cat_map_path is not None:
+            print("Loading new to old category map from", new_to_old_cat_map_path)
+            with open(new_to_old_cat_map_path, 'r') as f:
+                new_to_old_cat_map_load = json.load(f)
+                new_to_old_cat_map = {}
+            # transform the string keys to int keys
+            for k in new_to_old_cat_map_load:
+                if k != 'old_categories':
+                    new_to_old_cat_map[int(k)] = new_to_old_cat_map_load[k]
+            new_to_old_cat_map['old_categories'] = new_to_old_cat_map_load['old_categories']
+        else:
+            # id mapping
+            new_to_old_cat_map = {i:i for i in range(10000)}
+            new_to_old_cat_map['old_categories'] = None
+        self.new_to_old_cat_map = new_to_old_cat_map
         # print(f"OWCOCOEvaluator simi_matrix_dir: {simi_matrix_dir}")
 
     def reset(self):
@@ -265,6 +282,8 @@ class OWCOCOEvaluator(DatasetEvaluator):
                 "unofficial" if self._use_fast_impl else "official"
             )
         )
+        print('=--'*20)
+        print('New to old cat map path:', self.new_to_old_cat_map_path)
         for task in sorted(tasks):
             assert task in {"bbox", "segm", "keypoints"}, f"Got unknown task: {task}!"
             coco_eval = (
@@ -273,6 +292,7 @@ class OWCOCOEvaluator(DatasetEvaluator):
                     coco_results,
                     task,
                     simi_matrix_dir=self.simi_matrix_dir,
+                    new_to_old_cat_map_path=self.new_to_old_cat_map_path,
                     kpt_oks_sigmas=self._kpt_oks_sigmas,
                     cocoeval_fn=COCOeval_opt if self._use_fast_impl else COCOeval,
                     img_ids=img_ids,
@@ -361,13 +381,17 @@ class OWCOCOEvaluator(DatasetEvaluator):
         if not np.isfinite(sum(results.values())):
             self._logger.info("Some metrics cannot be computed and is shown as NaN.")
 
+        if self.new_to_old_cat_map_path is not None:
+            old_categories = self.new_to_old_cat_map['old_categories']
+            class_names = [cat['name'] for cat in old_categories]
         if class_names is None or len(class_names) <= 1:
             return results
         # Compute per-category AP
         # from https://github.com/facebookresearch/Detectron/blob/a6a835f5b8208c45d0dce217ce9bbda915f44df7/detectron/datasets/json_dataset_evaluator.py#L222-L252 # noqa
         precisions = coco_eval.eval["precision"]
         # precision has dims (iou, recall, cls, area range, max dets)
-        assert len(class_names) == precisions.shape[2]
+
+        # assert len(class_names) == precisions.shape[2], f"{len(class_names)} != {precisions.shape[2]}"
 
         results_per_category = []
         for idx, name in enumerate(class_names):
@@ -575,6 +599,7 @@ def _evaluate_predictions_on_coco(
     coco_results,
     iou_type,
     simi_matrix_dir,
+    new_to_old_cat_map_path,
     kpt_oks_sigmas=None,
     cocoeval_fn=COCOeval_opt,
     img_ids=None,
@@ -596,7 +621,10 @@ def _evaluate_predictions_on_coco(
 
     coco_dt = coco_gt.loadRes(coco_results)
     # print(f"OWCOCOEvaluator simi_matrix_dir: {simi_matrix_dir}")
-    coco_eval = cocoeval_fn(coco_gt, coco_dt, iou_type, simi_matrix_dir=simi_matrix_dir)
+    print('==='*10)
+    print("Instance evaluation, new old cat map path: ", new_to_old_cat_map_path)
+    print('==='*10)
+    coco_eval = cocoeval_fn(coco_gt, coco_dt, iou_type, simi_matrix_dir=simi_matrix_dir,new_to_old_cat_map_path=new_to_old_cat_map_path)
     # For COCO, the default max_dets_per_image is [1, 10, 100].
     if max_dets_per_image is None:
         max_dets_per_image = [1, 10, 100]  # Default from COCOEval

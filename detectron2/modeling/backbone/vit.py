@@ -16,10 +16,13 @@ from .utils import (
     window_unpartition,
 )
 
+from .upsamplers import ChannelNorm, PixImplicitUpsampler
+import torch.nn.functional as F
+
 logger = logging.getLogger(__name__)
 
 
-__all__ = ["ViT", "SimpleFeaturePyramid", "get_vit_lr_decay_rate"]
+__all__ = ["ViT", "SimpleFeaturePyramid", "SimpleFeatUpPyramid" "get_vit_lr_decay_rate"]
 
 
 class Attention(nn.Module):
@@ -522,3 +525,559 @@ def get_vit_lr_decay_rate(name, lr_decay_rate=1.0, num_layers=12):
             layer_id = int(name[name.find(".blocks.") :].split(".")[2]) + 1
 
     return lr_decay_rate ** (num_layers + 1 - layer_id)
+
+
+class SimpleFeatUpPyramid(Backbone):
+    """
+    Don't change the Pyramind, just upsample the backbone features to be 4x larger.
+    """
+
+    def __init__(
+        self,
+        net,
+        upsampler_path,
+        in_feature,
+        out_channels,
+        scale_factors,
+        top_block=None,
+        norm="LN",
+        square_pad=0,
+    ):
+        """
+        Args:
+            net (Backbone): module representing the subnetwork backbone.
+                Must be a subclass of :class:`Backbone`.
+            in_feature (str): names of the input feature maps coming
+                from the net.
+            out_channels (int): number of channels in the output feature maps.
+            scale_factors (list[float]): list of scaling factors to upsample or downsample
+                the input features for creating pyramid features.
+            top_block (nn.Module or None): if provided, an extra operation will
+                be performed on the output of the last (smallest resolution)
+                pyramid output, and the result will extend the result list. The top_block
+                further downsamples the feature map. It must have an attribute
+                "num_levels", meaning the number of extra pyramid levels added by
+                this block, and "in_feature", which is a string representing
+                its input feature (e.g., p5).
+            norm (str): the normalization to use.
+            square_pad (int): If > 0, require input images to be padded to specific square size.
+        """
+        super(SimpleFeatUpPyramid, self).__init__()
+        assert isinstance(net, Backbone)
+
+        self.scale_factors = scale_factors # [4.0, 2.0, 1.0, 0.5]
+        self.upsampler_path = upsampler_path
+        channelnorm, upsampler = self.load_upsampler_checkpoints(upsampler_path) # trained on 224x224 images (feat size 14x14)
+        print("Loaded the upsampler and channelnorm checkpoints.")
+        self.up_channelnorm = channelnorm
+        self.upsampler = upsampler
+
+        input_shapes = net.output_shape() # stride=16
+        strides = [int(input_shapes[in_feature].stride / scale) for scale in scale_factors] # [4, 8, 16, 32]
+        _assert_strides_are_log2_contiguous(strides)
+
+        dim = input_shapes[in_feature].channels
+        self.stages = []
+        use_bias = norm == ""
+        for idx, scale in enumerate(scale_factors):
+            out_dim = dim
+            if scale == 4.0:
+                layers = [
+                    nn.ConvTranspose2d(dim, dim // 2, kernel_size=2, stride=2),
+                    get_norm(norm, dim // 2),
+                    nn.GELU(),
+                    nn.ConvTranspose2d(dim // 2, dim // 4, kernel_size=2, stride=2),
+                ]
+                out_dim = dim // 4
+            elif scale == 2.0:
+                layers = [
+                    nn.ConvTranspose2d(dim, dim // 2, kernel_size=2, stride=2)
+                    ]
+                out_dim = dim // 2
+            elif scale == 1.0:
+                layers = []
+            elif scale == 0.5:
+                layers = [nn.MaxPool2d(kernel_size=2, stride=2)]
+            else:
+                raise NotImplementedError(f"scale_factor={scale} is not supported yet.")
+
+            layers.extend(
+                [
+                    Conv2d(
+                        out_dim,
+                        out_channels,
+                        kernel_size=1,
+                        bias=use_bias,
+                        norm=get_norm(norm, out_channels),
+                    ),
+                    Conv2d(
+                        out_channels,
+                        out_channels,
+                        kernel_size=3,
+                        padding=1,
+                        bias=use_bias,
+                        norm=get_norm(norm, out_channels),
+                    ),
+                ]
+            )
+            layers = nn.Sequential(*layers)
+
+            stage = int(math.log2(strides[idx]))
+            self.add_module(f"simfp_{stage}", layers)
+            self.stages.append(layers)
+
+        self.net = net
+        self.in_feature = in_feature
+        self.top_block = top_block
+        # Return feature names are "p<stage>", like ["p2", "p3", ..., "p6"]
+        self._out_feature_strides = {"p{}".format(int(math.log2(s))): s for s in strides}
+        # top block output feature maps.
+        if self.top_block is not None:
+            for s in range(stage, stage + self.top_block.num_levels):
+                self._out_feature_strides["p{}".format(s + 1)] = 2 ** (s + 1)
+
+        self._out_features = list(self._out_feature_strides.keys())
+        self._out_feature_channels = {k: out_channels for k in self._out_features}
+        self._size_divisibility = strides[-1]
+        self._square_pad = square_pad
+
+    def load_upsampler_checkpoints(self, upsampler_path, n_dim=768, lr_size=14):
+        channelnorm = ChannelNorm(n_dim)
+        upsampler = PixImplicitUpsampler(n_dim, lr_size=lr_size)
+        ckpt_weight = torch.load(upsampler_path)['state_dict']
+        channelnorm_checkpoint = {k: v for k, v in ckpt_weight.items() if 'model.1' in k} # dict_keys(['model.1.norm.weight', 'model.1.norm.bias'])
+        # change the key names
+        channelnorm_checkpoint = {k.replace('model.1.', ''): v for k, v in channelnorm_checkpoint.items()}
+        # if the key starts with upsampler, remove the upsampler.
+        upsampler_ckpt_weight = {k: v for k, v in ckpt_weight.items() if k.startswith('upsampler')}
+        upsampler_ckpt_weight = {k.replace('upsampler.', ''): v for k, v in upsampler_ckpt_weight.items()}
+        upsampler.load_state_dict(upsampler_ckpt_weight)
+        channelnorm.load_state_dict(channelnorm_checkpoint)
+        for param in upsampler.parameters():
+            param.requires_grad = False
+        for param in channelnorm.parameters():
+            param.requires_grad = False
+        return channelnorm, upsampler
+
+
+    @property
+    def padding_constraints(self):
+        return {
+            "size_divisiblity": self._size_divisibility,
+            "square_size": self._square_pad,
+        }
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (N,C,H,W). H, W must be a multiple of ``self.size_divisibility``.
+
+        Returns:
+            dict[str->Tensor]:
+                mapping from feature map name to pyramid feature map tensor
+                in high to low resolution order. Returned feature names follow the FPN
+                convention: "p<stage>", where stage has stride = 2 ** stage e.g.,
+                ["p2", "p3", ..., "p6"].
+        """
+        bottom_up_features = self.net(x)
+        features = bottom_up_features[self.in_feature]
+        with torch.no_grad():
+            features = self.up_channelnorm(features)
+            feat_size = features.shape[-2:]
+            upsampled_size = (feat_size[0] * 4, feat_size[1] * 4)
+            img = F.interpolate(x, size=upsampled_size, mode='bilinear', align_corners=False)
+            features = self.upsampler(features, img)
+        results = []
+
+        for stage in self.stages:
+            results.append(stage(features))
+
+        if self.top_block is not None:
+            if self.top_block.in_feature in bottom_up_features:
+                top_block_in_feature = bottom_up_features[self.top_block.in_feature]
+            else:
+                top_block_in_feature = results[self._out_features.index(self.top_block.in_feature)]
+            results.extend(self.top_block(top_block_in_feature))
+        assert len(self._out_features) == len(results)
+        return {f: res for f, res in zip(self._out_features, results)}
+
+
+class SimpleFeatUpPyramid3(Backbone):
+    """
+    Don't change the Pyramind, just upsample the backbone features to be 4x larger.
+    """
+
+    def __init__(
+        self,
+        net,
+        upsampler_path,
+        in_feature,
+        out_channels,
+        scale_factors,
+        top_block=None,
+        norm="LN",
+        square_pad=0,
+    ):
+        """
+        Args:
+            net (Backbone): module representing the subnetwork backbone.
+                Must be a subclass of :class:`Backbone`.
+            in_feature (str): names of the input feature maps coming
+                from the net.
+            out_channels (int): number of channels in the output feature maps.
+            scale_factors (list[float]): list of scaling factors to upsample or downsample
+                the input features for creating pyramid features.
+            top_block (nn.Module or None): if provided, an extra operation will
+                be performed on the output of the last (smallest resolution)
+                pyramid output, and the result will extend the result list. The top_block
+                further downsamples the feature map. It must have an attribute
+                "num_levels", meaning the number of extra pyramid levels added by
+                this block, and "in_feature", which is a string representing
+                its input feature (e.g., p5).
+            norm (str): the normalization to use.
+            square_pad (int): If > 0, require input images to be padded to specific square size.
+        """
+        super(SimpleFeatUpPyramid3, self).__init__()
+        assert isinstance(net, Backbone)
+
+        self.scale_factors = scale_factors # [4.0, 2.0, 1.0, 0.5]
+        self.upsampler_path = upsampler_path
+        channelnorm, upsampler = self.load_upsampler_checkpoints(upsampler_path) # trained on 224x224 images (feat size 14x14)
+        print("Loaded the upsampler and channelnorm checkpoints.")
+        self.up_channelnorm = channelnorm
+        self.upsampler = upsampler
+
+        input_shapes = net.output_shape() # stride=16
+        strides = [int(input_shapes[in_feature].stride / scale) for scale in scale_factors] # [4, 8, 16, 32]
+        _assert_strides_are_log2_contiguous(strides)
+
+        dim = input_shapes[in_feature].channels
+        self.stages = []
+        use_bias = norm == ""
+        for idx, scale in enumerate(scale_factors):
+            out_dim = dim
+            if scale == 8.0:
+                layers = []
+                # layers = [
+                #     nn.Conv2d(dim, dim // 4, kernel_size=1),
+                # ]
+                # out_dim = dim // 4
+            elif scale == 4.0:
+                layers = []
+                # layers = [
+                #     nn.Conv2d(dim, dim // 4, kernel_size=1),
+                # ]
+                # out_dim = dim // 4
+            elif scale == 2.0:
+                layers = []
+                # layers = [
+                #     nn.Conv2d(dim, dim // 2, kernel_size=1),
+                #     ]
+                # out_dim = dim // 2
+            elif scale == 1.0:
+                layers = []
+            elif scale == 0.5:
+                layers = [nn.MaxPool2d(kernel_size=2, stride=2)]
+            else:
+                raise NotImplementedError(f"scale_factor={scale} is not supported yet.")
+
+            layers.extend(
+                [
+                    Conv2d(
+                        out_dim,
+                        out_channels,
+                        kernel_size=1,
+                        bias=use_bias,
+                        norm=get_norm(norm, out_channels),
+                    ),
+                    Conv2d(
+                        out_channels,
+                        out_channels,
+                        kernel_size=3,
+                        padding=1,
+                        bias=use_bias,
+                        norm=get_norm(norm, out_channels),
+                    ),
+                ]
+            )
+            layers = nn.Sequential(*layers)
+
+            stage = int(math.log2(strides[idx]))
+            self.add_module(f"simfp_{stage}", layers)
+            self.stages.append(layers)
+
+        self.net = net
+        self.in_feature = in_feature
+        self.top_block = top_block
+        # Return feature names are "p<stage>", like ["p2", "p3", ..., "p6"]
+        self._out_feature_strides = {"p{}".format(int(math.log2(s))): s for s in strides}
+        # top block output feature maps.
+        if self.top_block is not None:
+            for s in range(stage, stage + self.top_block.num_levels):
+                self._out_feature_strides["p{}".format(s + 1)] = 2 ** (s + 1)
+
+        self._out_features = list(self._out_feature_strides.keys())
+        self._out_feature_channels = {k: out_channels for k in self._out_features}
+        self._size_divisibility = strides[-1]
+        self._square_pad = square_pad
+
+    def load_upsampler_checkpoints(self, upsampler_path, n_dim=768, lr_size=14):
+        channelnorm = ChannelNorm(n_dim)
+        upsampler = PixImplicitUpsampler(n_dim, lr_size=lr_size)
+        ckpt_weight = torch.load(upsampler_path)['state_dict']
+        channelnorm_checkpoint = {k: v for k, v in ckpt_weight.items() if 'model.1' in k} # dict_keys(['model.1.norm.weight', 'model.1.norm.bias'])
+        # change the key names
+        channelnorm_checkpoint = {k.replace('model.1.', ''): v for k, v in channelnorm_checkpoint.items()}
+        # if the key starts with upsampler, remove the upsampler.
+        upsampler_ckpt_weight = {k: v for k, v in ckpt_weight.items() if k.startswith('upsampler')}
+        upsampler_ckpt_weight = {k.replace('upsampler.', ''): v for k, v in upsampler_ckpt_weight.items()}
+        upsampler.load_state_dict(upsampler_ckpt_weight)
+        channelnorm.load_state_dict(channelnorm_checkpoint)
+        for param in upsampler.parameters():
+            param.requires_grad = False
+        for param in channelnorm.parameters():
+            param.requires_grad = False
+        return channelnorm, upsampler
+
+
+    @property
+    def padding_constraints(self):
+        return {
+            "size_divisiblity": self._size_divisibility,
+            "square_size": self._square_pad,
+        }
+    
+    def upsample(self, features, img, upsampling_factor=4):
+            features = self.up_channelnorm(features)
+            feat_size = features.shape[-2:]
+            upsampled_size = (feat_size[0] * int(upsampling_factor), feat_size[1] * int(upsampling_factor))
+            img = F.interpolate(img, size=upsampled_size, mode='bilinear', align_corners=False)
+            features = self.upsampler(features, img)
+            return features
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (N,C,H,W). H, W must be a multiple of ``self.size_divisibility``.
+
+        Returns:
+            dict[str->Tensor]:
+                mapping from feature map name to pyramid feature map tensor
+                in high to low resolution order. Returned feature names follow the FPN
+                convention: "p<stage>", where stage has stride = 2 ** stage e.g.,
+                ["p2", "p3", ..., "p6"].
+        """
+        bottom_up_features = self.net(x)
+        features = bottom_up_features[self.in_feature]
+        
+        results = []
+
+        for i, stage in enumerate(self.stages):
+            if i == 0:
+                features_8x = self.upsample(features, x, 8)
+                results.append(stage(features_8x))
+            elif i == 1:
+                features_4x = self.upsample(features, x, 4)
+                results.append(stage(features_4x))
+            elif i == 2:
+                features_2x = self.upsample(features, x, 2)
+                results.append(stage(features_2x))
+            elif i >= 3:
+                results.append(stage(features))
+        
+        if self.top_block is not None:
+            if self.top_block.in_feature in bottom_up_features:
+                top_block_in_feature = bottom_up_features[self.top_block.in_feature]
+            else:
+                top_block_in_feature = results[self._out_features.index(self.top_block.in_feature)]
+            results.extend(self.top_block(top_block_in_feature))
+        assert len(self._out_features) == len(results)
+        return {f: res for f, res in zip(self._out_features, results)}
+
+
+class SimpleFeatUpPyramid2(Backbone):
+    """
+    Don't change the Pyramind, just upsample the backbone features to be 4x larger.
+    """
+
+    def __init__(
+        self,
+        net,
+        upsampler_path,
+        in_feature,
+        out_channels,
+        scale_factors,
+        top_block=None,
+        norm="LN",
+        square_pad=0,
+    ):
+        """
+        Args:
+            net (Backbone): module representing the subnetwork backbone.
+                Must be a subclass of :class:`Backbone`.
+            in_feature (str): names of the input feature maps coming
+                from the net.
+            out_channels (int): number of channels in the output feature maps.
+            scale_factors (list[float]): list of scaling factors to upsample or downsample
+                the input features for creating pyramid features.
+            top_block (nn.Module or None): if provided, an extra operation will
+                be performed on the output of the last (smallest resolution)
+                pyramid output, and the result will extend the result list. The top_block
+                further downsamples the feature map. It must have an attribute
+                "num_levels", meaning the number of extra pyramid levels added by
+                this block, and "in_feature", which is a string representing
+                its input feature (e.g., p5).
+            norm (str): the normalization to use.
+            square_pad (int): If > 0, require input images to be padded to specific square size.
+        """
+        super(SimpleFeatUpPyramid2, self).__init__()
+        assert isinstance(net, Backbone)
+
+        self.scale_factors = scale_factors # [4.0, 2.0, 1.0, 0.5]
+        self.upsampler_path = upsampler_path
+        channelnorm, upsampler = self.load_upsampler_checkpoints(upsampler_path) # trained on 224x224 images (feat size 14x14)
+        print("Loaded the upsampler and channelnorm checkpoints.")
+        self.up_channelnorm = channelnorm
+        self.upsampler = upsampler
+
+        input_shapes = net.output_shape() # stride=16
+        strides = [int(input_shapes[in_feature].stride / scale) for scale in scale_factors] # [4, 8, 16, 32]
+        _assert_strides_are_log2_contiguous(strides)
+
+        dim = input_shapes[in_feature].channels
+        self.stages = []
+        use_bias = norm == ""
+        for idx, scale in enumerate(scale_factors):
+            out_dim = dim
+            if scale == 4.0:
+                layers = [
+                    # nn.ConvTranspose2d(dim, dim // 2, kernel_size=2, stride=1, padding=1),
+                    nn.Conv2d(dim, dim // 4, kernel_size=1),
+                    # get_norm(norm, dim // 2),
+                    # nn.GELU(),
+                    # # nn.ConvTranspose2d(dim // 2, dim // 4, kernel_size=2, stride=1),
+                    # nn.Conv2d(dim, dim // 2, kernel_size=1, stride=1, padding=1),
+                ]
+                out_dim = dim // 4
+            elif scale == 2.0:
+                layers = [
+                    nn.Conv2d(dim, dim // 2, kernel_size=1),
+                    ]
+                out_dim = dim // 2
+            elif scale == 1.0:
+                layers = []
+            elif scale == 0.5:
+                layers = [nn.MaxPool2d(kernel_size=2, stride=2)]
+            else:
+                raise NotImplementedError(f"scale_factor={scale} is not supported yet.")
+
+            layers.extend(
+                [
+                    Conv2d(
+                        out_dim,
+                        out_channels,
+                        kernel_size=1,
+                        bias=use_bias,
+                        norm=get_norm(norm, out_channels),
+                    ),
+                    Conv2d(
+                        out_channels,
+                        out_channels,
+                        kernel_size=3,
+                        padding=1,
+                        bias=use_bias,
+                        norm=get_norm(norm, out_channels),
+                    ),
+                ]
+            )
+            layers = nn.Sequential(*layers)
+
+            stage = int(math.log2(strides[idx]))
+            self.add_module(f"simfp_{stage}", layers)
+            self.stages.append(layers)
+
+        self.net = net
+        self.in_feature = in_feature
+        self.top_block = top_block
+        # Return feature names are "p<stage>", like ["p2", "p3", ..., "p6"]
+        self._out_feature_strides = {"p{}".format(int(math.log2(s))): s for s in strides}
+        # top block output feature maps.
+        if self.top_block is not None:
+            for s in range(stage, stage + self.top_block.num_levels):
+                self._out_feature_strides["p{}".format(s + 1)] = 2 ** (s + 1)
+
+        self._out_features = list(self._out_feature_strides.keys())
+        self._out_feature_channels = {k: out_channels for k in self._out_features}
+        self._size_divisibility = strides[-1]
+        self._square_pad = square_pad
+
+    def load_upsampler_checkpoints(self, upsampler_path, n_dim=768, lr_size=14):
+        channelnorm = ChannelNorm(n_dim)
+        upsampler = PixImplicitUpsampler(n_dim, lr_size=lr_size, cat_lr_feats=False)
+        ckpt_weight = torch.load(upsampler_path)['state_dict']
+        channelnorm_checkpoint = {k: v for k, v in ckpt_weight.items() if 'model.1' in k} # dict_keys(['model.1.norm.weight', 'model.1.norm.bias'])
+        # change the key names
+        channelnorm_checkpoint = {k.replace('model.1.', ''): v for k, v in channelnorm_checkpoint.items()}
+        # if the key starts with upsampler, remove the upsampler.
+        upsampler_ckpt_weight = {k: v for k, v in ckpt_weight.items() if k.startswith('upsampler')}
+        upsampler_ckpt_weight = {k.replace('upsampler.', ''): v for k, v in upsampler_ckpt_weight.items()}
+        upsampler.load_state_dict(upsampler_ckpt_weight)
+        channelnorm.load_state_dict(channelnorm_checkpoint)
+        for param in upsampler.parameters():
+            param.requires_grad = False
+        for param in channelnorm.parameters():
+            param.requires_grad = False
+        return channelnorm, upsampler
+
+
+    @property
+    def padding_constraints(self):
+        return {
+            "size_divisiblity": self._size_divisibility,
+            "square_size": self._square_pad,
+        }
+    
+    def upsample(self, features, img, upsampling_factor=4):
+        # with torch.no_grad():
+            features = self.up_channelnorm(features)
+            feat_size = features.shape[-2:]
+            upsampled_size = (feat_size[0] * int(upsampling_factor), feat_size[1] * int(upsampling_factor))
+            img = F.interpolate(img, size=upsampled_size, mode='bilinear', align_corners=False)
+            features = self.upsampler(features, img)
+            return features
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (N,C,H,W). H, W must be a multiple of ``self.size_divisibility``.
+
+        Returns:
+            dict[str->Tensor]:
+                mapping from feature map name to pyramid feature map tensor
+                in high to low resolution order. Returned feature names follow the FPN
+                convention: "p<stage>", where stage has stride = 2 ** stage e.g.,
+                ["p2", "p3", ..., "p6"].
+        """
+        bottom_up_features = self.net(x)
+        features = bottom_up_features[self.in_feature]
+        
+        results = []
+
+        for i, stage in enumerate(self.stages):
+            if i == 0:
+                features_4x = self.upsample(features, x, 4)
+                results.append(stage(features_4x))
+            elif i == 1:
+                features_2x = self.upsample(features, x, 2)
+                results.append(stage(features_2x))
+            elif i >= 2:
+                results.append(stage(features))
+        
+        if self.top_block is not None:
+            if self.top_block.in_feature in bottom_up_features:
+                top_block_in_feature = bottom_up_features[self.top_block.in_feature]
+            else:
+                top_block_in_feature = results[self._out_features.index(self.top_block.in_feature)]
+            results.extend(self.top_block(top_block_in_feature))
+        assert len(self._out_features) == len(results)
+        return {f: res for f, res in zip(self._out_features, results)}

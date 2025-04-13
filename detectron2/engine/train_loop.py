@@ -490,7 +490,12 @@ class AMPTrainer(SimpleTrainer):
 
         if self.zero_grad_before_forward:
             self.optimizer.zero_grad()
-        with autocast(dtype=self.precision):
+        # with autocast(dtype=self.precision):
+        with autocast():
+            # self.iter
+            # Can we also input self.iter to self.model? 
+            # NOTE: The model needs to be modified to accept the iteration number
+            # loss_dict = self.model(data, self.iter)
             loss_dict = self.model(data)
             if isinstance(loss_dict, torch.Tensor):
                 losses = loss_dict

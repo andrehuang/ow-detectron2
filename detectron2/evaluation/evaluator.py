@@ -192,6 +192,14 @@ def inference_on_dataset(
                     n=5,
                 )
             start_data_time = time.perf_counter()
+        ## Get the classname_max_indices
+        try:
+            torch.save(model.sem_seg_head.predictor.classname_max_indices, f'output/{model.exp_name}_classname_max_indices.pth')
+            print(f'Saved classname_max_indices to output/{model.exp_name}_classname_max_indices.pth')
+            # torch.save(model.sem_seg_head.predictor.classname_index_to_imgname, f'output/{model.exp_name}_classname_index_to_imgname.pth')
+            torch.save(model.sem_seg_head.predictor.filename_gtlabel_to_ious, f'output/{model.exp_name}_filename_gtlabel_to_ious.pth')
+        except:
+            pass
         dict.get(callbacks or {}, "on_end", lambda: None)()
 
     # Measure the time only for this worker (before the synchronization barrier)
